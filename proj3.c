@@ -31,14 +31,61 @@
 /* Data Structures */
 #define STACK_STR_LEN 1024
 #define STACK_LEN     16
+
+struct processID{
+    unsigned long stack_entries[STACK_LEN];
+    pid_t pid;
+};
+
 struct myData{
+    /* KEY START */
+    struct processID id;
     pid_t pid;
     unsigned long stack_entries[STACK_LEN];
+    /* KEY END */
+    struct stack_trace trace;
+    char comm[TASK_COMM_LEN];
     // char stack[STACK_STR_LEN];
     // bool isSleeping;
     unsigned long long sleepTime;
     unsigned long long dequeueTime;
 };
+
+void printStack(struct myData *data){
+    char buffer[STACK_STR_LEN];
+    
+    snprint_stack_trace(buffer, STACK_STR_LEN, &data->trace, 1);
+    DBG(data->pid, lu);
+    DBG(data->comm, s);
+    DBG(buffer, s);
+}
+
+struct myData *newMyData(void){
+    struct myData *data = (struct myData *) kmalloc(sizeof(struct myData), GFP_ATOMIC);
+    
+    /* Fill any struct padding with zeros for consistent hashing */
+    memset(
+        (char*)&data->pid+sizeof(data->pid), // Start of padding
+        0,
+        (char*)&data->stack_entries - (char*)&data->pid - sizeof(data->pid) // Size of padding
+    );
+    
+    // DBG((char*)&(data->pid)+sizeof(data->pid), p);
+    // DBG(&(data->stack_entries), p);
+    // DBG((char*)&data->stack_entries - (char*)&data->pid - sizeof(data->pid), u);
+    
+    /* init trace */
+    data->trace.nr_entries = 0;
+    data->trace.entries = data->stack_entries;
+    data->trace.max_entries = STACK_LEN;
+    data->trace.skip = 0;
+    
+    return data;
+}
+
+void freeMyData(struct myData *data){
+    kfree(data);
+}
 
 DEFINE_HASHTABLE(int_hashtable, 14); /* 2^14 buckets */ // FIX ME
 
@@ -48,15 +95,23 @@ struct int_hashtableEntry{
 };
 
 static inline u32 getHash(struct myData *data){
-    return jhash((void *)data, sizeof(pid_t), 0); // FIX ME
+    char *start = (char *)data;
+    char *end = (char *)(&data->stack_entries[data->trace.nr_entries]);
+    // DBG(start, p); DBG(end, p);
+    // DBG(end-start, u);
+    return jhash(start, end-start , 0);
 }
 
 static inline bool myDataisEqual(struct myData *data1, struct myData *data2){
-    if(data1->pid == data2->pid){
-        return true;
-    }
+    char *start = (char *)data1;
+    char *end = (char *)(&data1->stack_entries[data1->trace.nr_entries]);
     
-    return false;
+    return data1->trace.nr_entries == data2->trace.nr_entries && memcmp(data1, data2, end-start) == 0;
+    // if(data1->pid == data2->pid){
+        // return true;
+    // }
+    
+    // return false;
 }
 
 struct int_hashtableEntry *hashtable_search(struct myData *data){
@@ -98,27 +153,27 @@ int rbtree_insert(struct rb_root *root, struct int_rbnode *data){
     return 0;
 }
 
-void getStack(struct stack_trace *trace){
-    
+void updateStackTrace(struct task_struct *task, struct myData *data){
+    if(task == current){
+        data->trace.skip = 5;
+    }else{
+        data->trace.skip = 0;
+    }
+    save_stack_trace_tsk(task, &(data->trace));
 }
 
 /* Will either return existing myData struct if found, else return a new struct */
 static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, struct task_struct *task){
-    struct myData *tmpData = (struct myData *) kmalloc(sizeof(struct myData), GFP_KERNEL);
-    
-    struct stack_trace trace = {
-        .nr_entries = 0,
-        .entries = tmpData->stack_entries,
-        .max_entries = STACK_LEN,
-        .skip = 1
-    };
+    struct myData *tmpData = newMyData();
     
     tmpData->pid = task->pid;
-    save_stack_trace_tsk(task, &trace);
+    updateStackTrace(task, tmpData);
     
     *htEntry = hashtable_search(tmpData);
     if(*htEntry == NULL){
-        *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_KERNEL);
+        // strcpy(tmpData->comm, task->comm); printStack(tmpData); // Debug
+        strcpy(tmpData->comm, task->comm);
+        *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
         (*htEntry)->data = tmpData;
         return false;
     }else{
@@ -128,56 +183,51 @@ static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, str
 }
 
 
-// dequeue
+// dequeue/deactivate
 static inline int task_start_sleep(struct task_struct *task){
-    // struct myData *tmpData = (struct myData *) kmalloc(sizeof(struct myData), GFP_KERNEL);
-    // struct myData *data;
-    // struct int_hashtableEntry *htEntry;
-    
-    // struct stack_trace trace = {
-        // .nr_entries = 0,
-        // .entries = tmpData->stack_entries,
-        // .max_entries = STACK_LEN,
-        // .skip = 1
-    // };
-    
-    // tmpData->pid = task->pid;
-    // save_stack_trace_tsk(task, &trace);
-    
-    // htEntry = hashtable_search(tmpData);
-    // if(htEntry == NULL){
-        
-    // }
-    
     struct int_hashtableEntry *htEntry;
     struct int_rbnode *rbNode;
     
     if(getAppropriateStruct(&htEntry, task) == false){
-        /* New struct, need to add it to rbtree */
-        rbNode = (struct int_rbnode*) kmalloc(sizeof(struct int_rbnode), GFP_KERNEL);
+        /* New struct, need to add it to rbtree and hashtable */
+        /* Add to rbtree */
+        rbNode = (struct int_rbnode*) kmalloc(sizeof(struct int_rbnode), GFP_ATOMIC);
         rbNode->data = htEntry->data;
         rbtree_insert(&rbRoot, rbNode);
+        
+        // /* Add to hashtable */
+        hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
+        // PRINT("--------------------------------------------------------------Added");
     }else{
         
     }
     
     htEntry->data->dequeueTime = rdtsc();
+    // DBG(htEntry->data->sleepTime, llu);
+    
+    // PRINT("DEACK"); printStack( htEntry->data);
     
     return 0;
 }
 
-// enqueue
+// enqueue/Activate
 static inline int task_stop_sleep(struct task_struct *task){
     struct int_hashtableEntry *htEntry;
-    
+    // PRINT("THIS FUNCTION IS NOT BEING CALLED. I DON'T KNOW WHY");
     /* If the struct was not already there */
     if(getAppropriateStruct(&htEntry, task) == false){
-        kfree(htEntry->data);
+        // PRINT("ACK"); printStack( htEntry->data);
+        
+        freeMyData(htEntry->data);
         kfree(htEntry);
         return 0;
     }
     
+    // PRINT("ACK"); printStack( htEntry->data);
+    
     htEntry->data->sleepTime += (rdtsc() - htEntry->data->dequeueTime);
+    DBG(htEntry->data->sleepTime, llu);
+    // PRINT("THIS FUNCTION IS NOT BEING CALLED. I DON'T KNOW WHY");
     
     return 0;
 }
@@ -190,7 +240,7 @@ static inline int task_stop_sleep(struct task_struct *task){
 /* kprobe pre_handler: called just before the probed instruction is executed */
 static int activate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
     struct task_struct *task_pointer = (struct task_struct *)regs->ARG_REG_2;
-    pr_info("+ %04d=%s", task_pointer->pid, task_pointer->comm);
+    // PRINT("+ %04d=%s", task_pointer->pid, task_pointer->comm);
     
     // pr_info("<%s> pre_handler: p->addr = 0x%p, ip = %lx, flags = 0x%lx\n", p->symbol_name, p->addr, regs->ip, regs->flags);
 
@@ -200,21 +250,19 @@ static int activate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
     // dump_stack();
     // pr_info("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
     /* A dump_stack() here will give a stack backtrace */
+    task_stop_sleep(task_pointer);
+    
     return 0;
 }
 
 static int deactivate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
     struct task_struct *task_pointer = (struct task_struct *)regs->ARG_REG_2;
     
-    pr_info("- %04d=%s", task_pointer->pid, task_pointer->comm);
-    // pr_info("+++++++++++++++++++++++++++++++++++++++++++++++++");
+    // PRINT("- %04d=%s", task_pointer->pid, task_pointer->comm);
+    
+    task_start_sleep(task_pointer);
     
     return 0;
-}
-
-int hassan_test(int a, int b, int c, int d){
-    pr_info("function exed");
-    return a+b+c+d;
 }
 
 // static struct task_struct *kthread;
@@ -239,18 +287,35 @@ struct stack_trace trace = {
 /*********************************************************/
 #define PROCFS_NAME 		"lattop"
 
-static int jif_show(struct seq_file *m, void *v){
-    seq_printf(m, "Hold the door\n");
+static int lattop_proc_show(struct seq_file *m, void *v){
+    char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
+    int i;
+    struct int_hashtableEntry *tmp;
+    struct hlist_node *tmp_hlist_node;
+    
+    seq_printf(m, "START\n");
+    
+    hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
+        seq_printf(m, "-- %d - %s\n", tmp->data->pid, tmp->data->comm );
+        seq_printf(m, "Sleep Time: %llu\n", tmp->data->sleepTime);
+        snprint_stack_trace(buffer, STACK_STR_LEN, &tmp->data->trace, 1);
+        seq_printf(m, "%s\n", buffer);
+    }
+    
+    seq_printf(m, "STOP\n");
+    
+    kfree(buffer);
+    
     return 0;
 }
 
-static int jif_open(struct inode *inode, struct file *file){
-    return single_open(file, jif_show, NULL);
+static int lattop_proc_open(struct inode *inode, struct file *file){
+    return single_open(file, lattop_proc_show, NULL);
 }
 
 static const struct file_operations sysemu_proc_fops = {
     .owner    = THIS_MODULE,
-    .open     = jif_open,
+    .open     = lattop_proc_open,
     .read     = seq_read,
     .llseek   = seq_lseek,
     .release  = single_release,
@@ -286,12 +351,6 @@ static int __init lattop_module_init(void){
     // wake_up_process(kthread);
     
     // rdtsc();
-    
-    // save_stack_trace(&trace);
-    // snprint_stack_trace(cbuffer, 1024, &trace, 1);
-    // pr_info("%s", cbuffer);
-    // pr_info("------------------------------------------");
-    // dump_stack();
     
     /* Create the /proc file */
     if(!proc_create(PROCFS_NAME, 0, NULL, &sysemu_proc_fops)) {
