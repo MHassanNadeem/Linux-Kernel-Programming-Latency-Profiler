@@ -33,20 +33,14 @@
 #define STACK_LEN     16
 
 struct processID{
+    pid_t pid; // Needs to be at the top
     unsigned long stack_entries[STACK_LEN];
-    pid_t pid;
 };
 
 struct myData{
-    /* KEY START */
     struct processID id;
-    pid_t pid;
-    unsigned long stack_entries[STACK_LEN];
-    /* KEY END */
     struct stack_trace trace;
     char comm[TASK_COMM_LEN];
-    // char stack[STACK_STR_LEN];
-    // bool isSleeping;
     unsigned long long sleepTime;
     unsigned long long dequeueTime;
 };
@@ -55,9 +49,6 @@ void printStack(struct myData *data){
     char buffer[STACK_STR_LEN];
     
     snprint_stack_trace(buffer, STACK_STR_LEN, &data->trace, 1);
-    DBG(data->pid, lu);
-    DBG(data->comm, s);
-    DBG(buffer, s);
 }
 
 struct myData *newMyData(void){
@@ -65,18 +56,14 @@ struct myData *newMyData(void){
     
     /* Fill any struct padding with zeros for consistent hashing */
     memset(
-        (char*)&data->pid+sizeof(data->pid), // Start of padding
+        (char*)&data->id.pid + sizeof(data->id.pid), // Start of padding
         0,
-        (char*)&data->stack_entries - (char*)&data->pid - sizeof(data->pid) // Size of padding
+        (char*)&data->id.stack_entries - (char*)&data->id.pid - sizeof(data->id.pid) // Size of padding
     );
-    
-    // DBG((char*)&(data->pid)+sizeof(data->pid), p);
-    // DBG(&(data->stack_entries), p);
-    // DBG((char*)&data->stack_entries - (char*)&data->pid - sizeof(data->pid), u);
     
     /* init trace */
     data->trace.nr_entries = 0;
-    data->trace.entries = data->stack_entries;
+    data->trace.entries = data->id.stack_entries;
     data->trace.max_entries = STACK_LEN;
     data->trace.skip = 0;
     
@@ -95,23 +82,17 @@ struct int_hashtableEntry{
 };
 
 static inline u32 getHash(struct myData *data){
-    char *start = (char *)data;
-    char *end = (char *)(&data->stack_entries[data->trace.nr_entries]);
-    // DBG(start, p); DBG(end, p);
-    // DBG(end-start, u);
-    return jhash(start, end-start , 0);
+    char *start = (char *)&data->id;
+    char *end   = (char *)(&data->id.stack_entries[data->trace.nr_entries]);
+    
+    return jhash(start, end-start, 0);
 }
 
 static inline bool myDataisEqual(struct myData *data1, struct myData *data2){
-    char *start = (char *)data1;
-    char *end = (char *)(&data1->stack_entries[data1->trace.nr_entries]);
+    char *start = (char *)&data1->id;
+    char *end   = (char *)(&data1->id.stack_entries[data1->trace.nr_entries]);
     
     return data1->trace.nr_entries == data2->trace.nr_entries && memcmp(data1, data2, end-start) == 0;
-    // if(data1->pid == data2->pid){
-        // return true;
-    // }
-    
-    // return false;
 }
 
 struct int_hashtableEntry *hashtable_search(struct myData *data){
@@ -121,7 +102,7 @@ struct int_hashtableEntry *hashtable_search(struct myData *data){
         if(myDataisEqual(data, ret->data))
             return ret;
     }
-        
+
     return NULL;
 }
 
@@ -166,7 +147,7 @@ void updateStackTrace(struct task_struct *task, struct myData *data){
 static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, struct task_struct *task){
     struct myData *tmpData = newMyData();
     
-    tmpData->pid = task->pid;
+    tmpData->id.pid = task->pid;
     updateStackTrace(task, tmpData);
     
     *htEntry = hashtable_search(tmpData);
@@ -296,7 +277,7 @@ static int lattop_proc_show(struct seq_file *m, void *v){
     seq_printf(m, "START\n");
     
     hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
-        seq_printf(m, "-- %d - %s\n", tmp->data->pid, tmp->data->comm );
+        seq_printf(m, "-- %d - %s\n", tmp->data->id.pid, tmp->data->comm );
         seq_printf(m, "Sleep Time: %llu\n", tmp->data->sleepTime);
         snprint_stack_trace(buffer, STACK_STR_LEN, &tmp->data->trace, 1);
         seq_printf(m, "%s\n", buffer);
