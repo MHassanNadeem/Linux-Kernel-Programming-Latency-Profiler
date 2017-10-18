@@ -77,8 +77,10 @@ void freeMyData(struct myData *data){
 DEFINE_HASHTABLE(int_hashtable, 14); /* 2^14 buckets */ // FIX ME
 
 struct int_hashtableEntry{
-    struct hlist_node hnode;
-    struct myData *data;
+    struct rb_node     rbnode;
+    struct hlist_node  hnode;
+    struct myData      *data;
+    bool               isInTree;
 };
 
 static inline u32 getHash(struct myData *data){
@@ -106,19 +108,14 @@ struct int_hashtableEntry *hashtable_search(struct myData *data){
     return NULL;
 }
 
-struct int_rbnode{
-    struct rb_node node;
-    struct myData *data;
-};
-
 struct rb_root rbRoot = RB_ROOT;
 
-int rbtree_insert(struct rb_root *root, struct int_rbnode *data){
+int rbtree_insert(struct rb_root *root, struct int_hashtableEntry *data){
     struct rb_node **new = &(root->rb_node), *parent = NULL;
 
-    /* Figure out where to put new node */
+    /* Figure out where to put new rbnode */
     while (*new){
-        struct int_rbnode *this = container_of(*new, struct int_rbnode, node);
+        struct int_hashtableEntry *this = container_of(*new, struct int_hashtableEntry, rbnode);
 
         parent = *new;
         if (data->data->sleepTime < this->data->sleepTime)
@@ -127,9 +124,9 @@ int rbtree_insert(struct rb_root *root, struct int_rbnode *data){
             new = &((*new)->rb_right);
     }
 
-    /* Add new node and rebalance tree. */
-    rb_link_node(&data->node, parent, new);
-    rb_insert_color(&data->node, root);
+    /* Add new rbnode and rebalance tree. */
+    rb_link_node(&data->rbnode, parent, new);
+    rb_insert_color(&data->rbnode, root);
 
     return 0;
 }
@@ -156,6 +153,7 @@ static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, str
         strcpy(tmpData->comm, task->comm);
         *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
         (*htEntry)->data = tmpData;
+        (*htEntry)->isInTree = false;
         return false;
     }else{
         kfree(tmpData);
@@ -167,26 +165,13 @@ static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, str
 // dequeue/deactivate
 static inline int task_start_sleep(struct task_struct *task){
     struct int_hashtableEntry *htEntry;
-    struct int_rbnode *rbNode;
     
     if(getAppropriateStruct(&htEntry, task) == false){
-        /* New struct, need to add it to rbtree and hashtable */
-        /* Add to rbtree */
-        rbNode = (struct int_rbnode*) kmalloc(sizeof(struct int_rbnode), GFP_ATOMIC);
-        rbNode->data = htEntry->data;
-        rbtree_insert(&rbRoot, rbNode);
-        
-        // /* Add to hashtable */
+        /* New struct, need to add it to hashtable */
         hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
-        // PRINT("--------------------------------------------------------------Added");
-    }else{
-        
     }
     
     htEntry->data->dequeueTime = rdtsc();
-    // DBG(htEntry->data->sleepTime, llu);
-    
-    // PRINT("DEACK"); printStack( htEntry->data);
     
     return 0;
 }
@@ -194,23 +179,37 @@ static inline int task_start_sleep(struct task_struct *task){
 // enqueue/Activate
 static inline int task_stop_sleep(struct task_struct *task){
     struct int_hashtableEntry *htEntry;
-    // PRINT("THIS FUNCTION IS NOT BEING CALLED. I DON'T KNOW WHY");
+
     /* If the struct was not already there */
     if(getAppropriateStruct(&htEntry, task) == false){
-        // PRINT("ACK"); printStack( htEntry->data);
-        
         freeMyData(htEntry->data);
         kfree(htEntry);
         return 0;
     }
     
-    // PRINT("ACK"); printStack( htEntry->data);
-    
     htEntry->data->sleepTime += (rdtsc() - htEntry->data->dequeueTime);
-    DBG(htEntry->data->sleepTime, llu);
-    // PRINT("THIS FUNCTION IS NOT BEING CALLED. I DON'T KNOW WHY");
+    // DBG(htEntry->data->sleepTime, llu);
+    
+    if(htEntry->isInTree){
+        // PRINT("old RB_NODE Deleted");
+        // delete node
+        rb_erase(&htEntry->rbnode, &rbRoot);
+    }
+    
+    rbtree_insert(&rbRoot, htEntry);
+    htEntry->isInTree = true;
     
     return 0;
+}
+
+void insertDumDum(unsigned long long val){
+    struct myData *tmpData = newMyData();
+    struct int_hashtableEntry *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
+    
+    tmpData->sleepTime = val;
+    htEntry->data = tmpData;
+    
+    rbtree_insert(&rbRoot, htEntry);
 }
 
 #define ARG_REG_1 di
@@ -227,7 +226,7 @@ static int activate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
 
     // dump_stack_print_info(KERN_DEFAULT);
     
-    	// printk("%sCPU: %d PID: %d Comm: %.20s\n", KERN_DEFAULT, raw_smp_processor_id(), current->pid, current->comm);
+        // printk("%sCPU: %d PID: %d Comm: %.20s\n", KERN_DEFAULT, raw_smp_processor_id(), current->pid, current->comm);
     // dump_stack();
     // pr_info("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
     /* A dump_stack() here will give a stack backtrace */
@@ -263,10 +262,77 @@ struct stack_trace trace = {
     .skip = 1
 };
 
+/*---------------------------------------------------------------------------*/
+/* Stack Implementation */
+/*---------------------------------------------------------------------------*/
+struct IntList{
+    void* data;
+    struct list_head list;
+};
+
+static int stack_push(struct list_head *head, void *data){
+    struct IntList *tmp;
+
+    tmp = (struct IntList*)kmalloc(sizeof(struct IntList), GFP_ATOMIC);
+    if(tmp == NULL) goto error;
+    tmp->data = data;
+    list_add(&tmp->list, head);
+    return 0;
+    
+    error:
+        kfree(tmp);
+        return -1;
+}
+
+static inline int stack_isEmpty(struct list_head *head){
+    return list_empty(head);
+}
+
+static void* stack_pop(struct list_head *head){
+    struct IntList *ret;
+    ret = list_first_entry(head, struct IntList, list);
+    list_del(&ret->list);
+    return ret->data;
+}
+/*---------------------------------------------------------------------------*/
+
+static void rbTreePrinter(struct rb_root* root, struct seq_file *m){
+    LIST_HEAD(stack);
+    char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
+    struct myData *data;
+    bool done = false;
+    
+    struct rb_node *cursor = root->rb_node;
+    
+    while(!done){
+        if(cursor != NULL){
+            stack_push(&stack, cursor);
+            cursor = cursor->rb_left;
+        }else{
+            if(!stack_isEmpty(&stack)){
+                cursor = stack_pop(&stack);
+                
+                /* PRINT HERE */
+                data = rb_entry(cursor, struct int_hashtableEntry, rbnode)->data;
+                seq_printf(m, "-- %d - %s\n", data->id.pid, data->comm );
+                seq_printf(m, "Sleep Time: %llu\n", data->sleepTime);
+                snprint_stack_trace(buffer, STACK_STR_LEN, &data->trace, 1);
+                seq_printf(m, "%s\n", buffer);
+                
+                cursor = cursor->rb_right;
+            }else{
+                done = true;
+            }
+        }
+    }
+    
+    kfree(buffer);
+}
+
 /*********************************************************/
 /* PROC */
 /*********************************************************/
-#define PROCFS_NAME 		"lattop"
+#define PROCFS_NAME         "lattop"
 
 static int lattop_proc_show(struct seq_file *m, void *v){
     char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
@@ -276,12 +342,14 @@ static int lattop_proc_show(struct seq_file *m, void *v){
     
     seq_printf(m, "START\n");
     
-    hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
-        seq_printf(m, "-- %d - %s\n", tmp->data->id.pid, tmp->data->comm );
-        seq_printf(m, "Sleep Time: %llu\n", tmp->data->sleepTime);
-        snprint_stack_trace(buffer, STACK_STR_LEN, &tmp->data->trace, 1);
-        seq_printf(m, "%s\n", buffer);
-    }
+    // hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
+        // seq_printf(m, "-- %d - %s\n", tmp->data->id.pid, tmp->data->comm );
+        // seq_printf(m, "Sleep Time: %llu\n", tmp->data->sleepTime);
+        // snprint_stack_trace(buffer, STACK_STR_LEN, &tmp->data->trace, 1);
+        // seq_printf(m, "%s\n", buffer);
+    // }
+    
+    rbTreePrinter(&rbRoot, m);
     
     seq_printf(m, "STOP\n");
     
@@ -305,7 +373,7 @@ static const struct file_operations sysemu_proc_fops = {
 
 /* For each probe you need to allocate a kprobe structure */
 static struct kprobe kp_activate_task = {
-    .symbol_name	= "activate_task",
+    .symbol_name    = "activate_task",
 };
 
 static struct kprobe kp_deactivate_task = {
@@ -330,6 +398,14 @@ static int __init lattop_module_init(void){
     
     // kthread = kthread_create(work_func, NULL, "mykthread");
     // wake_up_process(kthread);
+    
+    /* TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT */
+    // insertDumDum(5);
+    // insertDumDum(1);
+    // insertDumDum(6);
+    // insertDumDum(2);
+    // insertDumDum(3);
+    /* TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT */
     
     // rdtsc();
     
