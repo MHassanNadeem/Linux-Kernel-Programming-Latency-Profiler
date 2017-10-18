@@ -53,6 +53,7 @@ void printStack(struct myData *data){
 
 struct myData *newMyData(void){
     struct myData *data = (struct myData *) kmalloc(sizeof(struct myData), GFP_ATOMIC);
+    if(data == NULL) return NULL;
     
     /* Fill any struct padding with zeros for consistent hashing */
     memset(
@@ -161,9 +162,18 @@ static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, str
     }
 }
 
+static inline int getTaskStruct(struct task_struct *task){
+    struct myData *tmpData = newMyData();
+    if(tmpData == NULL) return -ENOMEM;
+    
+    tmpData->id.pid = task->pid;
+    strcpy(tmpData->comm, task->comm);
+    updateStackTrace(task, tmpData);
+}
+
 
 // dequeue/deactivate
-static inline int task_start_sleep(struct task_struct *task){
+static inline int task_start_sleep(struct task_struct *task, unsigned long long time){
     struct int_hashtableEntry *htEntry;
     
     if(getAppropriateStruct(&htEntry, task) == false){
@@ -171,13 +181,13 @@ static inline int task_start_sleep(struct task_struct *task){
         hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
     }
     
-    htEntry->data->dequeueTime = rdtsc();
+    htEntry->data->dequeueTime = time;
     
     return 0;
 }
 
 // enqueue/Activate
-static inline int task_stop_sleep(struct task_struct *task){
+static inline int task_stop_sleep(struct task_struct *task, unsigned long long time){
     struct int_hashtableEntry *htEntry;
 
     /* If the struct was not already there */
@@ -187,7 +197,7 @@ static inline int task_stop_sleep(struct task_struct *task){
         return 0;
     }
     
-    htEntry->data->sleepTime += (rdtsc() - htEntry->data->dequeueTime);
+    htEntry->data->sleepTime += (time - htEntry->data->dequeueTime);
     // DBG(htEntry->data->sleepTime, llu);
     
     if(htEntry->isInTree){
@@ -220,27 +230,14 @@ void insertDumDum(unsigned long long val){
 /* kprobe pre_handler: called just before the probed instruction is executed */
 static int activate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
     struct task_struct *task_pointer = (struct task_struct *)regs->ARG_REG_2;
-    // PRINT("+ %04d=%s", task_pointer->pid, task_pointer->comm);
-    
-    // pr_info("<%s> pre_handler: p->addr = 0x%p, ip = %lx, flags = 0x%lx\n", p->symbol_name, p->addr, regs->ip, regs->flags);
-
-    // dump_stack_print_info(KERN_DEFAULT);
-    
-        // printk("%sCPU: %d PID: %d Comm: %.20s\n", KERN_DEFAULT, raw_smp_processor_id(), current->pid, current->comm);
-    // dump_stack();
-    // pr_info("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
-    /* A dump_stack() here will give a stack backtrace */
-    task_stop_sleep(task_pointer);
+    task_stop_sleep(task_pointer, rdtsc());
     
     return 0;
 }
 
 static int deactivate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
     struct task_struct *task_pointer = (struct task_struct *)regs->ARG_REG_2;
-    
-    // PRINT("- %04d=%s", task_pointer->pid, task_pointer->comm);
-    
-    task_start_sleep(task_pointer);
+    task_start_sleep(task_pointer, rdtsc());
     
     return 0;
 }
@@ -281,7 +278,7 @@ static int stack_push(struct list_head *head, void *data){
     
     error:
         kfree(tmp);
-        return -1;
+        return -ENOMEM;
 }
 
 static inline int stack_isEmpty(struct list_head *head){
@@ -289,10 +286,35 @@ static inline int stack_isEmpty(struct list_head *head){
 }
 
 static void* stack_pop(struct list_head *head){
-    struct IntList *ret;
-    ret = list_first_entry(head, struct IntList, list);
-    list_del(&ret->list);
-    return ret->data;
+    struct IntList *listNode;
+    void *data;
+    listNode = list_first_entry(head, struct IntList, list);
+    list_del(&listNode->list);
+    data = listNode->data;
+    kfree(listNode);
+    return data;
+}
+/*---------------------------------------------------------------------------*/
+
+/*---------------------------------------------------------------------------*/
+/* Queue Implementation */
+/*---------------------------------------------------------------------------*/
+static inline int enqueue(struct list_head *head, void *data){
+    stack_push(head, data);
+}
+
+static inline int queue_isEmpty(struct list_head *head){
+    return list_empty(head);
+}
+
+static void* dequeue(struct list_head *head){
+    struct IntList *listNode;
+    void *data;
+    listNode = list_last_entry(head, struct IntList, list);
+    list_del(&listNode->list);
+    data = listNode->data;
+    kfree(listNode);
+    return data;
 }
 /*---------------------------------------------------------------------------*/
 
