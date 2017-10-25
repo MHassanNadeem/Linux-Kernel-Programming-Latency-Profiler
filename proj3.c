@@ -21,85 +21,42 @@
 #include <linux/rbtree.h>
 #include <linux/types.h>
 
+MODULE_INFO(vermagic, "4.12.0+ SMP mod_unload ");
 
+/*---------------------------------------------------------------------------*/
+/* Macros */
+/*---------------------------------------------------------------------------*/
 #define DBG(var, type)          printk(KERN_INFO #var" = %"#type"\n", var)
 #define DBGM(var, type, desc)   printk(KERN_INFO desc" = %"#type"\n", var)
 #define PRINT(msg, ...)         printk(KERN_INFO msg, ##__VA_ARGS__)
-#define ERROR(msg, ...)         printk(KERN_ERR "ERROR: "msg, ##__VA_ARGS__)
-
-/*---------------------------------------------------------------------------*/
-/* Stack Implementation */
-/*---------------------------------------------------------------------------*/
-struct IntList{
-    void* data;
-    struct list_head list;
-};
-
-static int stack_push(struct list_head *head, void *data){
-    struct IntList *tmp;
-
-    tmp = (struct IntList*)kmalloc(sizeof(struct IntList), GFP_ATOMIC);
-    if(tmp == NULL) goto error;
-    tmp->data = data;
-    list_add(&tmp->list, head);
-    return 0;
-    
-    error:
-        kfree(tmp);
-        return -ENOMEM;
-}
-
-static inline int stack_isEmpty(struct list_head *head){
-    return list_empty(head);
-}
-
-static void* stack_pop(struct list_head *head){
-    struct IntList *listNode;
-    void *data;
-    listNode = list_first_entry(head, struct IntList, list);
-    list_del(&listNode->list);
-    data = listNode->data;
-    kfree(listNode);
-    return data;
-}
-/*---------------------------------------------------------------------------*/
-
-/*---------------------------------------------------------------------------*/
-/* Queue Implementation */
-/*---------------------------------------------------------------------------*/
-static inline int enqueue(struct list_head *head, void *data){
-    stack_push(head, data);
-}
-
-static inline int queue_isEmpty(struct list_head *head){
-    return list_empty(head);
-}
-
-static void* dequeue(struct list_head *head){
-    struct IntList *listNode;
-    void *data;
-    listNode = list_last_entry(head, struct IntList, list);
-    list_del(&listNode->list);
-    data = listNode->data;
-    kfree(listNode);
-    return data;
-}
-/*---------------------------------------------------------------------------*/
-
-LIST_HEAD(queue);
-
-// Concurrent access
-
-/* Data Structures */
-typedef enum {START_SLEEP, STOP_SLEEP} SchedEvent;
+#define ERROR(msg, ...)         printk(KERN_ALERT "ERROR: "msg, ##__VA_ARGS__)
 
 #define STACK_STR_LEN 1024
 #define STACK_LEN     16
 
+/*---------------------------------------------------------------------------*/
+/* Global Variables */
+/*---------------------------------------------------------------------------*/
+LIST_HEAD(queue);
+DEFINE_HASHTABLE(int_hashtable, 14); /* 2^14 buckets */
+struct rb_root rbRoot = RB_ROOT;
+
+static DEFINE_SPINLOCK(queue_lock);
+static DEFINE_SPINLOCK(ht_lock);
+
+/*---------------------------------------------------------------------------*/
+/* Data Structures */
+/*---------------------------------------------------------------------------*/
+typedef enum {START_SLEEP, STOP_SLEEP} SchedEvent;
+
 struct processID{
+    /* START OF KEY */
     pid_t pid; // Needs to be at the top
     unsigned long stack_entries[STACK_LEN]; // Needs to be 2nd
+    /* END OF KEY */
     struct stack_trace trace;
+    unsigned long stack_entries_user[STACK_LEN];
+    struct stack_trace trace_user;
     char comm[TASK_COMM_LEN];
 };
 
@@ -111,15 +68,94 @@ struct myData{
     SchedEvent event;
 };
 
-void printStack(struct myData *data){
-    char buffer[STACK_STR_LEN];
+struct int_hashtableEntry{
+    struct rb_node     rbnode;
+    struct hlist_node  hnode;
+    struct myData      *data;
+    bool               isInTree;
+};
+
+/*---------------------------------------------------------------------------*/
+/* Synchronized Queue Implementation */
+/*---------------------------------------------------------------------------*/
+struct MyPointerList{
+    void* data;
+    struct list_head list;
+};
+
+static inline int enqueue(struct list_head *head, void *data){
+    struct MyPointerList *tmp;
+    unsigned long flags;
+
+    tmp = (struct MyPointerList*)kmalloc(sizeof(struct MyPointerList), GFP_ATOMIC);
+    if(tmp == NULL) goto error;
+    tmp->data = data;
     
-    snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace, 1);
+    spin_lock_irqsave(&queue_lock, flags);
+        list_add(&tmp->list, head);
+    spin_unlock_irqrestore(&queue_lock, flags);
+    
+    return 0;
+    
+    error:
+        ERROR("kmalloc in enqueue failed");
+        return -ENOMEM;
 }
+
+static inline int queue_isEmpty(struct list_head *head){
+    int isEmpty;
+    unsigned long flags;
+    
+    spin_lock_irqsave(&queue_lock, flags);
+        isEmpty = list_empty(head);
+    spin_unlock_irqrestore(&queue_lock, flags);
+       
+    return isEmpty;
+}
+
+static void* dequeue(struct list_head *head){
+    struct MyPointerList *listNode;
+    void *data;
+    unsigned long flags;
+        
+    spin_lock_irqsave(&queue_lock, flags);
+        if(list_empty(head)){
+            ERROR("trying to dequeue an empty queue");
+            return NULL;
+        }
+        listNode = list_last_entry(head, struct MyPointerList, list);
+        list_del(&listNode->list);
+    spin_unlock_irqrestore(&queue_lock, flags);
+        
+    data = listNode->data;
+    kfree(listNode);
+    return data;
+}
+
+static int queue_destroy(struct list_head *head){
+    unsigned long flags;
+    struct MyPointerList *tmp;
+	struct list_head *pos, *pos2;
+	
+    spin_lock_irqsave(&queue_lock, flags);
+        list_for_each_safe(pos, pos2, head){
+            tmp = list_entry(pos, struct MyPointerList, list);
+            list_del(pos);
+            kfree(tmp->data);
+            kfree(tmp);
+        }
+    spin_unlock_irqrestore(&queue_lock, flags);
+	
+	return 0;
+}
+/*---------------------------------------------------------------------------*/
 
 struct myData *newMyData(void){
     struct myData *data = (struct myData *) kmalloc(sizeof(struct myData), GFP_ATOMIC);
-    if(data == NULL) return NULL;
+    if(data == NULL){
+        ERROR("kmalloc in newMyData failed");
+        return NULL;
+    }
     
     /* Fill any struct padding with zeros for consistent hashing */
     memset(
@@ -128,11 +164,17 @@ struct myData *newMyData(void){
         (char*)&data->id.stack_entries - (char*)&data->id.pid - sizeof(data->id.pid) // Size of padding
     );
     
-    /* init trace */
+    /* init kernel trace */
     data->id.trace.nr_entries = 0;
     data->id.trace.entries = data->id.stack_entries;
     data->id.trace.max_entries = STACK_LEN;
     data->id.trace.skip = 0;
+    
+    /* init user trace */
+    data->id.trace_user.nr_entries = 0;
+    data->id.trace_user.entries = data->id.stack_entries_user;
+    data->id.trace_user.max_entries = STACK_LEN;
+    data->id.trace_user.skip = 0;
     
     return data;
 }
@@ -141,14 +183,28 @@ void freeMyData(struct myData *data){
     kfree(data);
 }
 
-DEFINE_HASHTABLE(int_hashtable, 14); /* 2^14 buckets */ // FIX ME
+void printStack(struct myData *data){
+    char buffer[STACK_STR_LEN];
+    
+    snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace, 1);
+    
+    PRINT("PID: %ul %s", data->id.pid, data->id.comm);
+    PRINT("%s", buffer);
+}
 
-struct int_hashtableEntry{
-    struct rb_node     rbnode;
-    struct hlist_node  hnode;
-    struct myData      *data;
-    bool               isInTree;
-};
+static int hashtable_destroy(struct hlist_head *hashtable_head){
+    int i;
+    struct int_hashtableEntry *tmp;
+    struct hlist_node *tmp_hlist_node;
+    
+    hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
+        hash_del(&tmp->hnode);
+        kfree(tmp->data);
+        kfree(tmp);
+    }
+    
+    return 0;
+}
 
 static inline u32 getHash(struct myData *data){
     char *start = (char *)&data->id;
@@ -175,8 +231,6 @@ struct int_hashtableEntry *hashtable_search(struct myData *data){
     return NULL;
 }
 
-struct rb_root rbRoot = RB_ROOT;
-
 int rbtree_insert(struct rb_root *root, struct int_hashtableEntry *data){
     struct rb_node **new = &(root->rb_node), *parent = NULL;
 
@@ -200,45 +254,13 @@ int rbtree_insert(struct rb_root *root, struct int_hashtableEntry *data){
 
 void updateStackTrace(struct task_struct *task, struct myData *data){
     if(task == current){
+        // save_stack_trace_user(&(data->id.trace_user));
         data->id.trace.skip = 5;
     }else{
         data->id.trace.skip = 0;
     }
     save_stack_trace_tsk(task, &(data->id.trace));
 }
-
-/* Will either return existing myData struct if found, else return a new struct */
-static inline bool getAppropriateStruct(struct int_hashtableEntry **htEntry, struct task_struct *task){
-    struct myData *tmpData = newMyData();
-    
-    tmpData->id.pid = task->pid;
-    updateStackTrace(task, tmpData);
-    
-    *htEntry = hashtable_search(tmpData);
-    if(*htEntry == NULL){
-        // strcpy(tmpData->comm, task->comm); printStack(tmpData); // Debug
-        strcpy(tmpData->id.comm, task->comm);
-        *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
-        (*htEntry)->data = tmpData;
-        (*htEntry)->isInTree = false;
-        return false;
-    }else{
-        kfree(tmpData);
-        return true;
-    }
-}
-
-static inline int getTaskStruct(struct task_struct *task){
-    struct myData *tmpData = newMyData();
-    if(tmpData == NULL) return NULL;
-    
-    tmpData->id.pid = task->pid;
-    strcpy(tmpData->id.comm, task->comm);
-    updateStackTrace(task, tmpData);
-    
-    return tmpData;
-}
-
 
 // dequeue/deactivate
 static inline int task_start_sleep(struct task_struct *task, unsigned long long time){
@@ -248,42 +270,22 @@ static inline int task_start_sleep(struct task_struct *task, unsigned long long 
     updateStackTrace(task, tmpData);
     tmpData->timeStamp = time;
     tmpData->event = START_SLEEP;
-    /*********************/
-    struct int_hashtableEntry *htEntry;
     
-    if(getAppropriateStruct(&htEntry, task) == false){
-        /* New struct, need to add it to hashtable */
-        hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
-        enqueue(&queue, NULL);
-    }
-    
-    htEntry->data->dequeueTime = time;
+    enqueue(&queue, tmpData);
     
     return 0;
 }
 
 // enqueue/Activate
 static inline int task_stop_sleep(struct task_struct *task, unsigned long long time){
-    struct int_hashtableEntry *htEntry;
-
-    /* If the struct was not already there */
-    if(getAppropriateStruct(&htEntry, task) == false){
-        freeMyData(htEntry->data);
-        kfree(htEntry);
-        return 0;
-    }
+    struct myData *tmpData = newMyData();
+    tmpData->id.pid = task->pid;
+    strcpy(tmpData->id.comm, task->comm);
+    updateStackTrace(task, tmpData);
+    tmpData->timeStamp = time;
+    tmpData->event = STOP_SLEEP;
     
-    htEntry->data->sleepTime += (time - htEntry->data->dequeueTime);
-    // DBG(htEntry->data->sleepTime, llu);
-    
-    if(htEntry->isInTree){
-        // PRINT("old RB_NODE Deleted");
-        // delete node
-        rb_erase(&htEntry->rbnode, &rbRoot);
-    }
-    
-    rbtree_insert(&rbRoot, htEntry);
-    htEntry->isInTree = true;
+    enqueue(&queue, tmpData);
     
     return 0;
 }
@@ -319,34 +321,23 @@ static int deactivate_task_handler_pre(struct kprobe *p, struct pt_regs *regs){
 }
 
 static void rbTreePrinter(struct rb_root* root, struct seq_file *m){
-    LIST_HEAD(stack);
-    char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
     struct myData *data;
-    bool done = false;
-    
-    struct rb_node *cursor = root->rb_node;
-    
-    while(!done){
-        if(cursor != NULL){
-            stack_push(&stack, cursor);
-            cursor = cursor->rb_left;
-        }else{
-            if(!stack_isEmpty(&stack)){
-                cursor = stack_pop(&stack);
-                
-                /* PRINT HERE */
-                data = rb_entry(cursor, struct int_hashtableEntry, rbnode)->data;
-                seq_printf(m, "-- %d - %s\n", data->id.pid, data->id.comm );
-                seq_printf(m, "Sleep Time: %llu\n", data->sleepTime);
-                snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace, 1);
-                seq_printf(m, "%s\n", buffer);
-                
-                cursor = cursor->rb_right;
-            }else{
-                done = true;
-            }
-        }
+    struct rb_node *cursor = rb_last(root);
+    char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
+    if(buffer == NULL){
+        ERROR("kmalloc in rbTreePrinter failed");
+        return;
     }
+    
+    while(cursor){
+        data = rb_entry(cursor, struct int_hashtableEntry, rbnode)->data;
+        seq_printf(m, "-- %d - %s\n", data->id.pid, data->id.comm );
+        seq_printf(m, "Sleep Time: %llu\n", data->sleepTime);
+        snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace, 1);
+        seq_printf(m, "%s\n", buffer);
+        
+        cursor = rb_prev(cursor);
+    };
     
     kfree(buffer);
 }
@@ -357,25 +348,13 @@ static void rbTreePrinter(struct rb_root* root, struct seq_file *m){
 #define PROCFS_NAME         "lattop"
 
 static int lattop_proc_show(struct seq_file *m, void *v){
-    char *buffer = (char *) kmalloc(sizeof(char) * STACK_STR_LEN, GFP_ATOMIC);
-    int i;
-    struct int_hashtableEntry *tmp;
-    struct hlist_node *tmp_hlist_node;
+    seq_printf(m, "++++++++++++++++++++\n");
+
+    spin_lock(&ht_lock);
+        rbTreePrinter(&rbRoot, m);
+    spin_unlock(&ht_lock);
     
-    seq_printf(m, "START\n");
-    
-    // hash_for_each_safe(int_hashtable, i, tmp_hlist_node, tmp, hnode){
-        // seq_printf(m, "-- %d - %s\n", tmp->data->id.pid, tmp->data->comm );
-        // seq_printf(m, "Sleep Time: %llu\n", tmp->data->sleepTime);
-        // snprint_stack_trace(buffer, STACK_STR_LEN, &tmp->data->trace, 1);
-        // seq_printf(m, "%s\n", buffer);
-    // }
-    
-    rbTreePrinter(&rbRoot, m);
-    
-    seq_printf(m, "STOP\n");
-    
-    kfree(buffer);
+    seq_printf(m, "--------------------\n");
     
     return 0;
 }
@@ -392,18 +371,66 @@ static const struct file_operations sysemu_proc_fops = {
     .release  = single_release,
 };
 
+void process_start_sleep(struct myData *data){
+    struct int_hashtableEntry *htEntry;
+    // PRINT("START");
+    // printStack(data);
+    
+    htEntry = hashtable_search(data);
+    if(htEntry == NULL){
+        htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
+        if(htEntry == NULL){
+            ERROR("kmalloc in process_start_sleep failed");
+            return;
+        }
+        htEntry->data = data;
+        htEntry->data->dequeueTime = htEntry->data->timeStamp;
+        htEntry->isInTree = false;
+        hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
+    }else{
+        freeMyData(data);
+    }
+}
+
+void process_end_sleep(struct myData *data){
+    struct int_hashtableEntry *htEntry;
+    // PRINT("END");
+    // printStack(data);
+    
+    htEntry = hashtable_search(data);
+    if(htEntry == NULL){
+        freeMyData(data);
+        return;
+    }
+    
+    htEntry->data->sleepTime += (htEntry->data->timeStamp - htEntry->data->dequeueTime);
+    
+     if(htEntry->isInTree){
+        rb_erase(&htEntry->rbnode, &rbRoot);
+    }
+    
+    rbtree_insert(&rbRoot, htEntry);
+    htEntry->isInTree = true;
+}
 
 static struct task_struct *kthread = NULL;
-int work_func(void *data){
-    PRINT("Worker thread started");
+int work_func(void *args){
+    int i;
+    struct myData *data;
+    PRINT("Worker thread started!");
     while(!kthread_should_stop()){
-        if(queue_isEmpty(&queue)){
-            schedule_timeout(100);
-            // PRINT("Queue is empty");
-        }else{
-            dequeue(&queue);
-            PRINT("dequeued");
-        }
+        schedule_timeout(100);
+        
+        spin_lock(&ht_lock);
+            for(i=0; i<10&&!queue_isEmpty(&queue); i++){
+                data = (struct myData *) dequeue(&queue);
+                if(data->event == START_SLEEP){
+                    process_start_sleep(data);
+                }else{
+                    process_end_sleep(data);
+                }
+            }
+        spin_unlock(&ht_lock);
     }
     
     do_exit(0);
@@ -443,14 +470,6 @@ static int __init lattop_module_init(void){
     }
     /*---------------------------------------*/
     
-    /* TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT */
-    // insertDumDum(5);
-    // insertDumDum(1);
-    // insertDumDum(6);
-    // insertDumDum(2);
-    // insertDumDum(3);
-    /* TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT */
-    
     /* Create the /proc file */
     if(!proc_create(PROCFS_NAME, 0, NULL, &sysemu_proc_fops)) {
         ERROR("Could not initialize /proc/%s\n", PROCFS_NAME);
@@ -466,6 +485,10 @@ static void __exit lattop_module_exit(void){
     unregister_kprobe(&kp_deactivate_task);
     remove_proc_entry(PROCFS_NAME, NULL);
     if(kthread) kthread_stop(kthread);
+    
+    /* Free memory */
+    hashtable_destroy(int_hashtable); // frees hashtable & rbtree
+    queue_destroy(&queue);
 }
 
 module_init(lattop_module_init)
