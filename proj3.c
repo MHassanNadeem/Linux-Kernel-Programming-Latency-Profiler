@@ -6,6 +6,7 @@
 * */
 
 #include <linux/kernel.h>
+#include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/printk.h>
 #include <linux/export.h>
@@ -55,9 +56,9 @@ struct processID{
     unsigned long stack_entries[STACK_LEN]; // Needs to be 2nd
     /* END OF KEY */
     struct stack_trace trace;
+    char comm[TASK_COMM_LEN];
     unsigned long stack_entries_user[STACK_LEN];
     struct stack_trace trace_user;
-    char comm[TASK_COMM_LEN];
 };
 
 struct myData{
@@ -135,8 +136,8 @@ static void* dequeue(struct list_head *head){
 static int queue_destroy(struct list_head *head){
     unsigned long flags;
     struct MyPointerList *tmp;
-	struct list_head *pos, *pos2;
-	
+    struct list_head *pos, *pos2;
+    
     spin_lock_irqsave(&queue_lock, flags);
         list_for_each_safe(pos, pos2, head){
             tmp = list_entry(pos, struct MyPointerList, list);
@@ -145,9 +146,74 @@ static int queue_destroy(struct list_head *head){
             kfree(tmp);
         }
     spin_unlock_irqrestore(&queue_lock, flags);
-	
-	return 0;
+    
+    return 0;
 }
+/*---------------------------------------------------------------------------*/
+
+
+/*---------------------------------------------------------------------------*/
+/* Userspace stacktrace - based on kernel/trace/trace_sysprof.c */
+/*---------------------------------------------------------------------------*/
+struct stack_frame_user {
+    const void __user    *next_fp;
+    unsigned long        ret_addr;
+};
+
+static int
+copy_stack_frame(const void __user *fp, struct stack_frame_user *frame)
+{
+    int ret;
+
+    if (!access_ok(VERIFY_READ, fp, sizeof(*frame)))
+        return 0;
+
+    ret = 1;
+    pagefault_disable();
+    if (__copy_from_user_inatomic(frame, fp, sizeof(*frame)))
+        ret = 0;
+    pagefault_enable();
+
+    return ret;
+}
+
+static inline void __save_stack_trace_user(struct stack_trace *trace)
+{
+    const struct pt_regs *regs = task_pt_regs(current);
+    const void __user *fp = (const void __user *)regs->bp;
+
+    if (trace->nr_entries < trace->max_entries)
+        trace->entries[trace->nr_entries++] = regs->ip;
+
+    while (trace->nr_entries < trace->max_entries) {
+        struct stack_frame_user frame;
+
+        frame.next_fp = NULL;
+        frame.ret_addr = 0;
+        if (!copy_stack_frame(fp, &frame))
+            break;
+        if ((unsigned long)fp < regs->sp)
+            break;
+        if (frame.ret_addr) {
+            trace->entries[trace->nr_entries++] =
+                frame.ret_addr;
+        }
+        if (fp == frame.next_fp)
+            break;
+        fp = frame.next_fp;
+    }
+}
+
+void save_stack_trace_user(struct stack_trace *trace)
+{
+    /*
+     * Trace user stack if we are not a kernel thread
+     */
+    if (current->mm) {
+        __save_stack_trace_user(trace);
+    }
+}
+
 /*---------------------------------------------------------------------------*/
 
 struct myData *newMyData(void){
@@ -175,6 +241,7 @@ struct myData *newMyData(void){
     data->id.trace_user.entries = data->id.stack_entries_user;
     data->id.trace_user.max_entries = STACK_LEN;
     data->id.trace_user.skip = 0;
+    data->id.stack_entries_user[data->id.trace_user.nr_entries++] = ULONG_MAX;
     
     return data;
 }
@@ -254,7 +321,6 @@ int rbtree_insert(struct rb_root *root, struct int_hashtableEntry *data){
 
 void updateStackTrace(struct task_struct *task, struct myData *data){
     if(task == current){
-        // save_stack_trace_user(&(data->id.trace_user));
         data->id.trace.skip = 5;
     }else{
         data->id.trace.skip = 0;
@@ -270,6 +336,8 @@ static inline int task_start_sleep(struct task_struct *task, unsigned long long 
     updateStackTrace(task, tmpData);
     tmpData->timeStamp = time;
     tmpData->event = START_SLEEP;
+    
+    save_stack_trace_user(&(tmpData->id.trace_user));
     
     enqueue(&queue, tmpData);
     
@@ -288,16 +356,6 @@ static inline int task_stop_sleep(struct task_struct *task, unsigned long long t
     enqueue(&queue, tmpData);
     
     return 0;
-}
-
-void insertDumDum(unsigned long long val){
-    struct myData *tmpData = newMyData();
-    struct int_hashtableEntry *htEntry = (struct int_hashtableEntry *) kmalloc(sizeof(struct int_hashtableEntry), GFP_ATOMIC);
-    
-    tmpData->sleepTime = val;
-    htEntry->data = tmpData;
-    
-    rbtree_insert(&rbRoot, htEntry);
 }
 
 #define ARG_REG_1 di
@@ -334,7 +392,11 @@ static void rbTreePrinter(struct rb_root* root, struct seq_file *m){
         seq_printf(m, "-- %d - %s\n", data->id.pid, data->id.comm );
         seq_printf(m, "Sleep Time: %llu\n", data->sleepTime);
         snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace, 1);
-        seq_printf(m, "%s\n", buffer);
+        seq_printf(m, "Kernel Stack:\n%s\n", buffer);
+        if(data->id.trace_user.nr_entries > 1){
+            snprint_stack_trace(buffer, STACK_STR_LEN, &data->id.trace_user, 1);
+            seq_printf(m, "User Stack:\n%s\n", buffer);
+        }
         
         cursor = rb_prev(cursor);
     };
