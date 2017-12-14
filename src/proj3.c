@@ -22,7 +22,6 @@
 #include <linux/rbtree.h>
 #include <linux/types.h>
 
-MODULE_INFO(vermagic, "4.12.0+ SMP mod_unload ");
 
 /*---------------------------------------------------------------------------*/
 /* Macros */
