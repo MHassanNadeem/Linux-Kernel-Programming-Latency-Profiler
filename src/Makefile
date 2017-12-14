@@ -24,7 +24,7 @@ buildrun: all run
 
 clone:
 	rm linux -rf
-	#git clone https://github.com/MHassanNadeem/linux.git
+	git clone https://github.com/MHassanNadeem/linux.git
 
 save_lattop:
 	cat /proc/lattop > lattency_profile.txt
