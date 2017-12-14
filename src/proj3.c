@@ -449,6 +449,7 @@ void process_start_sleep(struct myData *data){
         htEntry->isInTree = false;
         hash_add(int_hashtable, &htEntry->hnode, getHash(htEntry->data));
     }else{
+        htEntry->data->dequeueTime = data->timeStamp;
         freeMyData(data);
     }
 }
@@ -464,7 +465,7 @@ void process_end_sleep(struct myData *data){
         return;
     }
     
-    htEntry->data->sleepTime += (htEntry->data->timeStamp - htEntry->data->dequeueTime);
+    htEntry->data->sleepTime += (data->timeStamp - htEntry->data->dequeueTime);
     
      if(htEntry->isInTree){
         rb_erase(&htEntry->rbnode, &rbRoot);
@@ -472,18 +473,19 @@ void process_end_sleep(struct myData *data){
     
     rbtree_insert(&rbRoot, htEntry);
     htEntry->isInTree = true;
+    
+    freeMyData(data);
 }
 
 static struct task_struct *kthread = NULL;
 int work_func(void *args){
-    int i;
     struct myData *data;
     PRINT("Worker thread started!");
     while(!kthread_should_stop()){
-        schedule_timeout(100);
+        msleep(50);
         
         spin_lock(&ht_lock);
-            for(i=0; i<10&&!queue_isEmpty(&queue); i++){
+            while(!queue_isEmpty(&queue)){
                 data = (struct myData *) dequeue(&queue);
                 if(data->event == START_SLEEP){
                     process_start_sleep(data);
